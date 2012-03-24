@@ -27,10 +27,24 @@ class KeymazeCache(object):
                'height INTEGER',
                'birthday INTEGER' )
     
-    TRACKINFO = ('device','start','time','distance','kcal','maxspeed',
-                 'maxheart','avgheart','cmlplus','cmlmin','track','id')
+    TRACKINFO = ('id',
+                 'device',
+                 'start',
+                 'time',
+                 'distance',
+                 'kcal',
+                 'maxspeed',
+                 'maxheart',
+                 'avgheart',
+                 'cmlplus',
+                 'cmlmin',
+                 'track',
+                 'idx',
+                 'laps')
     
-    TRACKPOINT = ('device','track','point','lat','long','alt','speed',
+    LAPINFO = ('device', 'track', 'lap', 'acctime', 'tottime', 'totdist', 'kcal', 'maxspeed', 'maxheart', 'avgheart', 'startptidx', 'endptidx')
+    
+    TRACKPOINT = ('device','track','point','lap','lat','long','alt','speed',
                   'heart','delta')
     
     def __init__(self, log, dbpath, device=None):
@@ -50,8 +64,10 @@ class KeymazeCache(object):
         c = self.db.cursor()
         sql = ','.join(KeymazeCache.DEVINFO)
         c.execute('CREATE TABLE dev_info (%s)' % sql)
-        sql = ','.join('%s INTEGER' % it for it in KeymazeCache.TRACKINFO)
-        c.execute('CREATE TABLE tp_catalog (%s)' % sql)
+        sql = ','.join(map(lambda colName: '%s INTEGER' % colName, KeymazeCache.TRACKINFO[1:]))
+        c.execute('CREATE TABLE tp_catalog (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)' % sql)
+        sql = ','.join('%s INTEGER' % it for it in KeymazeCache.LAPINFO)
+        c.execute('CREATE TABLE tp_laps (%s)' % sql)
         sql = ','.join('%s INTEGER' % it for it in KeymazeCache.TRACKPOINT)
         c.execute('CREATE TABLE tp_points (%s)' % sql)
         self.db.commit()
@@ -99,9 +115,9 @@ class KeymazeCache(object):
                 self.log.info('%u is not in cache' % tp['start'])
                 values = []
                 tp['device'] = device
-                for k in self.TRACKINFO:
+                for k in self.TRACKINFO[1:]:
                     values.append(tp[k])
-                c.execute('INSERT INTO tp_catalog VALUES (%s)' % \
+                c.execute('INSERT INTO tp_catalog VALUES (NULL, %s)' % \
                             sqlparams(values), values)    
                 self.db.commit()
         c.execute('SELECT %s FROM tp_catalog WHERE device=?' % \
@@ -123,17 +139,17 @@ class KeymazeCache(object):
 
     def get_trackpoints(self, device, track):
         c = self.db.cursor()
-        c.execute('SELECT track FROM tp_points WHERE device=? AND track=? '
-                  'LIMIT 1', (device, track))
+        c.execute('SELECT track FROM tp_points WHERE track=? '
+                  'LIMIT 1', (str(track['id'])))
         row = c.fetchone()
         if not row:
             self.log.debug('Trackpoint not in cache')
             if not self.device:
                 raise AssertionError('Device is not available')
             self._load_trackpoints(device, track)
-        c.execute('SELECT %s FROM tp_points WHERE device=? AND track=? '
-                  'ORDER BY point' % ','.join(self.TRACKPOINT[3:]), 
-                  (device, track))
+        c.execute('SELECT %s FROM tp_points WHERE track=? '
+                  'ORDER BY point' % ','.join(self.TRACKPOINT[4:]), 
+                  (str(track['id'])))
         return c.fetchall()
         
     def get_device(self, sn):
@@ -145,12 +161,22 @@ class KeymazeCache(object):
         return row[0]
 
     def _load_trackpoints(self, device, track):
-        tpoints = self.device.get_trackpoints(track)
+        (laps, tpoints) = self.device.get_trackpoints(track['track'])
         c = self.db.cursor()
         point = 0
+        
+        for idx,lap in enumerate(laps):
+            values = []
+            lap['device'] = device
+            lap['track'] = track['id']
+            lap['lap'] = idx
+            for k in self.LAPINFO:
+                values.append(lap[k])
+            c.execute('INSERT INTO tp_laps VALUES (%s)' % sqlparams(values), values)
+        
         for tp in tpoints['points']:
             point += 1
-            values = [device, track, point]
+            values = [device, track['id'], point]
             values.extend(tp)
             c.execute('INSERT INTO tp_points VALUES (%s)' % sqlparams(values),
                       values)

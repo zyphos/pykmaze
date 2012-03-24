@@ -36,13 +36,15 @@ class KeymazePort(object):
     CMD_TP_DIR = 0x78
     CMD_TP_GET_HDR = 0x80
     CMD_TP_GET_NEXT = 0x81
+    CMD_TP_GET_LAST = 0x82
     CMD_INFO_GET = 0x85
     ACK_TP_GET_NONE = 0x8a
     
     # Note: device use big-endian encoding
     TP_CAT_FMT = '3B3BBIIHHBB2h3H'  # 31
-    TP_HDR_FMT = 'IIIHHBBI'         # 22
-    TP_ENT_FMT = 'iihHHB'           # 15
+    TP_HDR_FMT = 'IIIHHBBI'         # 22 => DB_LAP
+    TP_DB_LAP = 'IIIHHBBHH'         # 22
+    TP_ENT_FMT = 'iihHBH'           # 15
     INFO_FMT = '12s13x17s11sBBxBxBxBxBx3x3B16x' 
     
     def __init__(self, log, portname):
@@ -72,7 +74,7 @@ class KeymazePort(object):
     
     def get_information(self):
         """Obtaint the device information"""
-        (resp, ack) = self._request_device(self.CMD_INFO_GET)
+        (resp, ack) = self._request_device(self.CMD_INFO_GET, '', [], True)
         (name,sn,user,gender,age,x1,weight,x2,height,y,m,d) = \
             struct.unpack('>%s' % self.INFO_FMT, resp)
         name = name[:name.find('\0')]
@@ -104,8 +106,8 @@ class KeymazePort(object):
             (yy,mm,dd,hh,mn,ss,lap,dtime,dst,kcal,mspd,mhr,ahr,cmi,cmd,
              _,track,idx) = \
                 struct.unpack('>%s' % self.TP_CAT_FMT, resp[start:end])
-            if lap > 1:
-                raise AssertionError('Multi-lap entries not supported')
+            #if lap > 1:
+            #    raise AssertionError('Multi-lap entries not supported')
             dtime /= 10
             lap_hour = dtime//3600
             dtime -= lap_hour*3600
@@ -122,10 +124,19 @@ class KeymazePort(object):
                    'cmlplus' : cmi,
                    'cmlmin' : cmd,
                    'track': track,
-                   'id': idx }
+                   'idx': idx ,
+                   'laps' : lap}
             trackpoints.append(tp) 
             start = end
         return trackpoints
+        
+    def _get_lap_index_for_point(self, laps, pointIdx):
+        lapIdx = 0
+        for i, lap in enumerate(laps):
+            if (lap['endptidx'] >= pointIdx):
+                lapIdx = i
+                break
+        return lapIdx
         
     def get_trackpoints(self, track):
         """Obtain the trackpoints of an activity"""
@@ -134,19 +145,40 @@ class KeymazePort(object):
         trackpoints = []
         start = 0
         # New catatalog entry
-        end = start+struct.calcsize('>%s%s' % (self.TP_CAT_FMT, 
-                                               self.TP_HDR_FMT))
+        end = start+struct.calcsize('>%s' % (self.TP_CAT_FMT))
         if end > len(resp):
             raise AssertionError('Missing data in response %d / %d' % \
                                     (end, len(resp)))
         # there are 6 trailing bytes whose signification is yet to be
         # discovered, decoded here into the silent variable '_'
-        (yy,mm,dd,hh,mn,ss,lap,dtime,dst,kcal,mspd,mhr,ahr,cmi,cmd,_,
-         track,idx,stop,ttime,tdst,tkcal,tmspd,tmhr,tahr,count) = \
-            struct.unpack('>%s%s' % (self.TP_CAT_FMT, self.TP_HDR_FMT), 
+        (yy,mm,dd,hh,mn,ss,lap,dtime,dst,kcal,mspd,mhr,ahr,cmi,cmd,_,track,idx) = \
+            struct.unpack('>%s' % (self.TP_CAT_FMT), 
                           resp[start:end])
-        if lap > 1:
-            raise AssertionError('Multi-lap entries not supported')
+        #if lap > 1:
+        #    raise AssertionError('Multi-lap entries not supported')
+        rem_lap = lap
+        laps = []
+        count = 0
+        while rem_lap > 0:
+            start = end
+            end = start + struct.calcsize('%s' % (self.TP_DB_LAP))
+            (stop,ttime,tdst,kcal,mspd,mhr,ahr,sidx,eidx) = \
+                struct.unpack('>%s' % (self.TP_DB_LAP), 
+                              resp[start:end])
+            lap = {
+                'acctime' : stop,
+                'tottime' : ttime,
+                'totdist' : tdst,
+                'kcal' :  kcal,
+                'maxspeed': mspd,
+                'maxheart': mhr,
+                'avgheart': ahr,
+                'startptidx': sidx,
+                'endptidx': eidx,
+                'points' : []}
+            laps.append(lap)
+            count = eidx
+            rem_lap -= 1
         lap_sec = dtime//10
         lap_msec = (dtime-lap_sec*10)*100
         tp = { 'start': datetime.datetime(2000+yy,mm,dd,hh,mn,ss),
@@ -159,9 +191,11 @@ class KeymazePort(object):
                'cmlplus' : cmi,
                'cmlmin' : cmd,
                'count' : count,
+               'laps' : lap,
                'points' : []}
         rem_tp = count
-        print 'Points: %d' % count
+        print 'Points: %d' % count 
+        
         while rem_tp > 0:
             (resp, ack) = self._request_device(self.CMD_TP_GET_NEXT,
                                                accept=[self.ACK_TP_GET_NONE,
@@ -176,9 +210,10 @@ class KeymazePort(object):
             start = end
             points = []
             while start+entry_len <= len(resp):
+                lapIdx = self._get_lap_index_for_point(laps, count-rem_tp)
                 (x,y,z,s,h,d) = struct.unpack('>%s' % self.TP_ENT_FMT, 
                                               resp[start:start+entry_len])
-                points.append((x,y,z,s,h,d))
+                points.append((lapIdx,x,y,z,s,h,d))
                 rem_tp -= 1
                 start += entry_len
             tp['points'].extend(points)
@@ -189,12 +224,13 @@ class KeymazePort(object):
             if start < len(resp):
                 self.log.error("Remaining bytes: %s" % hexdump(resp[start:]))
         print ''
-        return tp
+        return (laps, tp)
 
     def _request_device(self, command, params='', accept=[], debug=False):
         req = struct.pack('>BHB', self.CMD_PREFIX, 1+len(params), command)
         req += params
         req += struct.pack('>B', self._calc_checksum(req[1:]))
+
         self._port.timeout = 2
         resp_h = None
         accept.append(command)

@@ -22,11 +22,11 @@ import sys
 def show_trackpoints_catalog(cat):
     sorted_cat = list(cat)
     sorted_cat.sort(key=lambda e: e['id'])
-    print " #   Day         Start  End    Duration  Distance  AltMin   AltMax"
+    print " #   Day         Start  End    Duration  Distance  AltMin   AltMax    Laps"
     for tpent in sorted_cat:
         stime = time.localtime(tpent['start'])
-        print ' %02d  %s  %s  %s    %s  %6.2fkm %s  %s' % \
-            (tpent['id']+1,
+        print ' %02d  %s  %s  %s    %s  %6.2fkm %s  %s  %s' % \
+            (tpent['id'],
              time.strftime('%Y-%m-%d', stime),
              time.strftime('%H:%M', stime),
              time.strftime('%H:%M', 
@@ -37,7 +37,8 @@ def show_trackpoints_catalog(cat):
                 '     -',
              tpent['distance']/1000.0,
              tpent['altmin'] and '%6dm' % tpent['altmin'] or '      -', 
-             tpent['altmax'] and '%6dm' % tpent['altmax'] or '      -')
+             tpent['altmax'] and '%6dm' % tpent['altmax'] or '      -',
+             tpent['laps'] and '%6d' % tpent['laps'] or '      -')
 
 def parse_trim(trim_times):
     tcre = re.compile(r'^(?P<r>[+-])?'
@@ -239,8 +240,8 @@ if __name__ == '__main__':
             for tp in tpcat:
                 if None in (tp['altmin'], tp['altmax']):
                     log.info('Should load sync track %d from device' % \
-                             (int(tp['id'])+1))
-                    cache.get_trackpoints(device, tp['track'])
+                             (int(tp['id'])))
+                    cache.get_trackpoints(device, tp)
                     reload_cache = True
             if reload_cache:
                 tpcat = cache.get_trackpoint_catalog(device)
@@ -258,16 +259,16 @@ if __name__ == '__main__':
                 log.debug('Tracks %s' % tracks)
             else:
                 for tp in tpcat:
-                    track = int(options.track)-1
+                    track = int(options.track)
                     if int(tp['id']) == track: 
-                        tracks = [tp['track']]
+                        tracks = [tp]
                         break
                 if not tracks:
                     raise AssertionError('Track "%s" does not exist' % \
                                          options.track)
             tpoints = []
             for track in tracks:
-                log.info('Recovering trackpoints for track %u' % track)
+                log.info('Recovering trackpoints for track %u' % track['id'])
                 tpoints = cache.get_trackpoints(device, track)
             if len(tracks) == 1:
                 km = options.kml or options.kmz
@@ -277,7 +278,7 @@ if __name__ == '__main__':
                     from gpx import GpxDoc
                     
                 if km or options.gpx:
-                    track_info = filter(lambda x: x['track'] == track, 
+                    track_info = filter(lambda x: x['id'] == track['id'], 
                                         tpcat)[0]
                     if options.trim:
                         trims = parse_trim(options.trim.split(','))

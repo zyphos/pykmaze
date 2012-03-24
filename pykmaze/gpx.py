@@ -73,6 +73,9 @@ class GpxDoc(object):
             ET.SubElement(trkpt, 'time').text = self._mktime(curtime)
             ET.SubElement(trkpt, 'sym').text = 'Waypoint'
             self._updateBounds(tp[0], tp[1])
+            ext = ET.SubElement(trkpt, 'extensions')
+            garmin = ET.SubElement(ext, 'gpxtpx:TrackPointExtension')
+            ET.SubElement(garmin, 'gpxtpx:hr').text = str(tp[4])
             
     def write(self, out):
         out.write('<?xml version="1.0" encoding="UTF-8"?>')
