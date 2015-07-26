@@ -139,8 +139,9 @@ class KeymazeCache(object):
 
     def get_trackpoints(self, device, track):
         c = self.db.cursor()
-        c.execute('SELECT track FROM tp_points WHERE track=? '
-                  'LIMIT 1', (str(track['id'])))
+        print (str(track['id']))
+        c.execute('SELECT track FROM tp_points WHERE track=? LIMIT 1',
+                  (str(track['id']),))
         row = c.fetchone()
         if not row:
             self.log.debug('Trackpoint not in cache')
@@ -149,7 +150,7 @@ class KeymazeCache(object):
             self._load_trackpoints(device, track)
         c.execute('SELECT %s FROM tp_points WHERE track=? '
                   'ORDER BY point' % ','.join(self.TRACKPOINT[4:]), 
-                  (str(track['id'])))
+                  (str(track['id']),))
         return c.fetchall()
         
     def get_device(self, sn):
