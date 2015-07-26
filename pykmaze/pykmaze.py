@@ -18,6 +18,8 @@ import os
 import re
 import time
 import sys
+import glob
+import serial
 
 def show_trackpoints_catalog(cat):
     sorted_cat = list(cat)
@@ -151,6 +153,204 @@ def optimize(points, angle=0):
             opt.append(tp)
     return opt
 
+def get_available_serial_ports():
+    # Code from Thomas @ Stackoverflow
+    # http://stackoverflow.com/questions/12090503/listing-available-com-ports-with-python
+    """Lists serial ports
+
+    :raises EnvironmentError:
+        On unsupported or unknown platforms
+    :returns:
+        A list of available serial ports
+    """
+    if sys.platform.startswith('win'):
+        ports = ['COM' + str(i + 1) for i in range(256)]
+
+    elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
+        # this is to exclude your current terminal "/dev/tty"
+        ports = glob.glob('/dev/tty[A-Za-z]*')
+
+    elif sys.platform.startswith('darwin'):
+        ports = glob.glob('/dev/tty.*')
+
+    else:
+        raise EnvironmentError('Unsupported platform')
+
+    result = []
+    for port in ports:
+        try:
+            s = serial.Serial(port)
+            s.close()
+            result.append(port)
+        except (OSError, serial.SerialException):
+            pass
+    return result
+
+
+class Keymaze(object):
+    def __init__(self, dbpath = None, port=None, offline_mode=False):
+        log = logging.getLogger('pykmaze')
+        log.setLevel(logging.INFO)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(levelname)s - %(message)s")
+        ch.setFormatter(formatter)
+        log.addHandler(ch)
+        self.log = log
+        
+        if port is None:
+            serial_ports = get_available_serial_ports()
+            if len(serial_ports) == 0:
+                print 'No serial port detected, going to offline mode'
+                offline_mode = True
+            else:
+                print 'Available serial port:'
+                print serial_ports
+                port = serial_ports[0]
+                print 'Taking %s' % port
+        
+        if dbpath is None:
+            dbpath = self._get_default_dbpath()
+        self.dbpath = dbpath
+        
+        if not offline_mode:
+            self.set_online_mode(port)
+        else:
+            self.set_offline_mode()
+    
+    def set_offline_mode(self):
+        self.init_keymaze(None)
+        self.current_mode = 'offline'
+    
+    def set_online_mode(self, port):
+        keymaze_port = KeymazePort(self.log, port)
+        self.init_keymaze(keymaze_port)
+        self.current_mode = 'online'
+        
+    def init_keymaze(self, keymaze_port):
+        self.cache = KeymazeCache(self.log, self.dbpath, keymaze_port)
+        info = self.cache.get_information()
+        self.device = self.cache.get_device(info['serialnumber'])
+        self.tpcat = self.cache.get_trackpoint_catalog(self.device)
+    
+    def _get_default_dbpath(self):
+        dbname = 'pykmaze.sqlite'
+        dbpath = 'HOME' in os.environ and os.environ['HOME'] or '.'
+        if sys.platform.lower() in ('darwin'):
+            dbpath = os.path.join(dbpath, 'Library', 'Application Support', 
+                                  'Pykmaze', dbname)
+        else:
+            dbpath = os.path.join(dbpath, '.pykmaze', dbname)
+        return dbpath
+    
+    def print_info(self):
+        print ' Device: %s' % self.info['name']
+        print ' Owner:  %s' % self.info['user']
+        print ' S/N:    %s' % self.info['serialnumber']
+        print ''
+    
+    def sync(self):
+        if self.current_mode == 'offline':
+            raise AssertionError('Cannot sync from device in offline mode')
+        reload_cache = False
+        for tp in self.tpcat:
+            if None in (tp['altmin'], tp['altmax']):
+                self.log.info('Should load sync track %d from device' % \
+                         (int(tp['id'])))
+                self.cache.get_trackpoints(self.device, tp)
+                reload_cache = True
+        if reload_cache:
+            self.tpcat = self.cache.get_trackpoint_catalog(self.device)
+    
+    def show_catalog(self):
+        show_trackpoints_catalog(self.tpcat)
+        print ''
+    
+    def get_all_tracks(self):
+        tracks = [tp['track'] for tp in self.tpcat]
+        self.log.debug('Tracks %s' % tracks)
+        return tracks
+        
+    def get_trackinfo_from_name(self, trackname):
+        trackname = int(trackname)
+        for tp in self.tpcat:
+            if int(tp['id']) == trackname:
+                return tp
+        raise AssertionError('Track "%s" does not exist' % \
+                                         trackname)
+    
+    def get_trackpoints(self, trackinfo):
+        self.log.info('Recovering trackpoints for track %u' % trackinfo['id'])
+        tpoints = self.cache.get_trackpoints(self.device, trackinfo)
+        return tpoints
+    
+    def get_trackinfo(self, track):
+        return filter(lambda x: x['id'] == track['id'], 
+                                        self.tpcat)[0]
+    
+    def trim_trackpoints(self, track_info, tpoints, trim):
+        trims = parse_trim(trim.split(','))
+        self.log.info('All points: %d' % len(tpoints))
+        tpoints = trim_trackpoints(track_info, tpoints, trims)
+        self.log.info('Filtered points: %d' % len(tpoints))
+        return tpoints
+    
+    def export_track(self, track, filename, filetype, trim=None,
+                     prepend_datetime=False, zoffset=0, mode='default'):
+        # filetype 'gpx', 'kmz' or 'km'
+        if filetype not in ['kmz', 'kml', 'gpx']:
+            raise AssertionError('Unsupported filetype %s' % filetype)
+        
+        track_info = self.get_trackinfo(track)
+        tpoints = self.get_trackpoints(track_info)
+        if prepend_datetime:
+            stime = time.localtime(track_info['start'])
+            filename = os.path.join(os.path.dirname(filename),
+                       time.strftime('%Y-%m-%d-%H-%M-%S-', stime) + \
+                       os.path.basename(filename))
+        
+        is_km = filetype in ['kmz', 'kml']
+        if is_km:
+            from kml import KmlDoc
+        if filetype == 'gpx':
+            from gpx import GpxDoc
+
+        if trim:
+            tpoints = trim_trackpoints(track_info, tpoints, trim)
+
+        optpoints = optimize(tpoints, 0)
+        self.log.info('Count: %u, opt: %u', 
+                  len(tpoints), len(optpoints))
+        if is_km:
+            kml = KmlDoc(os.path.splitext(os.path.basename(filename))[0])
+            kml.add_trackpoints(optpoints, int(zoffset), 
+                                extrude='air' not in mode)
+        if filetype == 'kmz':
+            import zipfile
+            import cStringIO as StringIO
+            out = StringIO.StringIO()
+            kml.write(out)
+            out.write('\n')
+            z = zipfile.ZipFile(filename, 'w', 
+                                zipfile.ZIP_DEFLATED)
+            z.writestr('doc.kml', out.getvalue())
+        if filetype == 'kml':
+            with open(filename, 'wt') as out:
+                kml.write(out)
+                out.write('\n')
+        
+        if filetype == 'gpx':
+            gpx = GpxDoc(os.path.splitext( \
+                         os.path.basename(filename))[0],
+                         track_info['start'])
+            gpx.add_trackpoints(optpoints, int(zoffset))
+            with open(filename, 'wt') as out:
+                gpx.write(out)
+                out.write('\n')
+    
+    def export_all_tracks(self, basename, filetype):
+        for track in self.get_all_tracks():
+            self.export_track(track, basename, filetype, prepend_datetime=True)
 
 if __name__ == '__main__':
     dbname = 'pykmaze.sqlite'
@@ -165,7 +365,7 @@ if __name__ == '__main__':
             '   Keymaze 500-700 communicator'
     optparser = OptionParser(usage=usage)
     optparser.add_option('-p', '--port', dest='port',
-                         default='/dev/cu.usbserial',
+                         default=None,
                          help='Serial port name')
     optparser.add_option('-k', '--kml', dest='kml',
                          help='Export to KML, output file name')
@@ -204,117 +404,42 @@ if __name__ == '__main__':
     
     (options, args) = optparser.parse_args(sys.argv[1:])
     
-    log = logging.getLogger('pykmaze')
-    log.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter("%(levelname)s - %(message)s")
-    ch.setFormatter(formatter)
-    log.addHandler(ch)
     
     try:
         if options.force and options.offline:
             raise AssertionError('Force and offline modes are mutually '
                                  'exclusive')
-        keymaze = None
-        if not options.offline:
-            keymaze = KeymazePort(log, options.port)
-        elif options.sync:
-            raise AssertionError('Cannot sync from device in offline mode')
-        cache = KeymazeCache(log, options.storage, keymaze)
-
-        info = cache.get_information()
+        keymaze = Keymaze(dbpath=options.storage, port=options.port, offline_mode=options.offline)
 
         if options.info:
-            print ' Device: %s' % info['name']
-            print ' Owner:  %s' % info['user']
-            print ' S/N:    %s' % info['serialnumber']
-            print ''
-        
-        device = cache.get_device(info['serialnumber'])
-        
-        tpcat = cache.get_trackpoint_catalog(device)
+            keymaze.print_info()
         
         if options.sync:
-            reload_cache = False
-            for tp in tpcat:
-                if None in (tp['altmin'], tp['altmax']):
-                    log.info('Should load sync track %d from device' % \
-                             (int(tp['id'])))
-                    cache.get_trackpoints(device, tp)
-                    reload_cache = True
-            if reload_cache:
-                tpcat = cache.get_trackpoint_catalog(device)
+            keymaze.sync()
                     
         if options.catalog:
-            show_trackpoints_catalog(tpcat)
-            print ''
+            keymaze.show_catalog()
         
-        if options.track:
-            tracks = []
-            if options.track in ['all']:
-                if options.kml or options.kmz or options.gpx:
-                    raise AssertionError('Cannot export several tracks')
-                tracks = [tp['track'] for tp in tpcat]
-                log.debug('Tracks %s' % tracks)
-            else:
-                for tp in tpcat:
-                    track = int(options.track)
-                    if int(tp['id']) == track: 
-                        tracks = [tp]
-                        break
-                if not tracks:
-                    raise AssertionError('Track "%s" does not exist' % \
-                                         options.track)
-            tpoints = []
-            for track in tracks:
-                log.info('Recovering trackpoints for track %u' % track['id'])
-                tpoints = cache.get_trackpoints(device, track)
-            if len(tracks) == 1:
-                km = options.kml or options.kmz
-                if km:
-                    from kml import KmlDoc
-                if options.gpx:
-                    from gpx import GpxDoc
-                    
-                if km or options.gpx:
-                    track_info = filter(lambda x: x['id'] == track['id'], 
-                                        tpcat)[0]
-                    if options.trim:
-                        trims = parse_trim(options.trim.split(','))
-                        log.info('All points: %d' % len(tpoints))
-                        tpoints = trim_trackpoints(track_info, tpoints, trims)
-                        log.info('Filtered points: %d' % len(tpoints))
-                    optpoints = optimize(tpoints, 0)
-                    log.info('Count: %u, opt: %u', 
-                              len(tpoints), len(optpoints))
-                if km:
-                    kml = KmlDoc(os.path.splitext(os.path.basename(km))[0])
-                    kml.add_trackpoints(optpoints, int(options.zoffset), 
-                                        extrude='air' not in options.mode)
-                if options.kmz:
-                    import zipfile
-                    import cStringIO as StringIO
-                    out = StringIO.StringIO()
-                    kml.write(out)
-                    out.write('\n')
-                    z = zipfile.ZipFile(options.kmz, 'w', 
-                                        zipfile.ZIP_DEFLATED)
-                    z.writestr('doc.kml', out.getvalue())
-                if options.kml:
-                    with open(options.kml, 'wt') as out:
-                        kml.write(out)
-                        out.write('\n')
-                
-                if options.gpx:
-                    gpx = GpxDoc(os.path.splitext( \
-                                 os.path.basename(options.gpx))[0],
-                                 track_info['start'])
-                    gpx.add_trackpoints(optpoints, int(options.zoffset))
-                    with open(options.gpx, 'wt') as out:
-                        gpx.write(out)
-                        out.write('\n')
+        if not options.track or options.track == 'all':
+            tracks = keymaze.tpcat
+            prepend_datetime = True
+        else:
+            tracks = [keymaze.get_track_from_name(options.track)]
+            prepend_datetime = False
+
+        for track in tracks:
+            if options.kml:
+                keymaze.export_track(track, options.kml, 'kml',
+                                     options.trim, prepend_datetime,
+                                     options.zoffset, options.mode)
+            if options.kmz:
+                keymaze.export_track(track, options.kmz, 'kmz',
+                                     options.trim, prepend_datetime,
+                                     options.zoffset, options.mode)
+            if options.gpx:
+                keymaze.export_track(track, options.gpx, 'gpx',
+                                     options.trim, prepend_datetime,
+                                     options.zoffset, options.mode)
                         
     except AssertionError, e:
         print >> sys.stderr, 'Error: %s' % e[0]
-
